@@ -1,0 +1,87 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function me() { return get(/databases/$(db)/documents/users/$(request.auth.uid)).data; }
+    function isAdmin() { return signedIn() && me().role == 'admin'; }
+    function isRetailer() { return signedIn() && me().role == 'retailer' && me().status == 'active'; }
+    function inShop(shopId) {
+      return signedIn() && (request.auth.uid == shopId
+        || (me().role == 'operator' && me().shopId == shopId && me().active == true)
+        || isAdmin());
+    }
+
+    // Public: registration fees + admin UPI (needed on the register screen)
+    match /settings/{doc} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Public shop page (name, phone, UPI) – no incentive data here
+    match /shops/{shopId} {
+      allow read: if true;
+      allow write: if signedIn() && (isAdmin() || (request.auth.uid == shopId && isRetailer()));
+    }
+
+    // Public list of services so customers can see availability
+    match /services/{id} {
+      allow read: if true;
+      allow create, update: if isRetailer() && request.resource.data.shopId == request.auth.uid;
+      allow delete: if isRetailer() && resource.data.shopId == request.auth.uid;
+    }
+
+    match /users/{userId} {
+      allow read: if signedIn() && (
+        request.auth.uid == userId
+        || isAdmin()
+        || resource.data.get('shopId', '') == request.auth.uid
+        || resource.data.get('referredBy', '') == request.auth.uid
+        || (me().role == 'operator' && me().shopId == userId));
+
+      // Self sign-up: retailer is active at once; distributor types start unpaid
+      allow create: if signedIn() && (
+        (request.auth.uid == userId
+          && request.resource.data.role in ['retailer', 'distributor', 'superdistributor']
+          && (request.resource.data.role == 'retailer'
+              ? request.resource.data.status == 'active'
+              : request.resource.data.status == 'pending_payment'))
+        // Retailer adds an operator to their own shop
+        || (isRetailer()
+          && request.resource.data.role == 'operator'
+          && request.resource.data.shopId == request.auth.uid));
+
+      allow update: if signedIn() && (
+        isAdmin()
+        || (request.auth.uid == userId
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(
+              ['name','phone','shopName','address','upiId','upiName','commissionPct',
+               'bonusTarget','bonusAmount','levels','paymentRef','paymentSubmitted']))
+        || (isRetailer() && resource.data.get('shopId', '') == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(
+              ['name','phone','level','active'])));
+
+      allow delete: if isAdmin();
+    }
+
+    match /orders/{id} {
+      allow read: if signedIn() && inShop(resource.data.shopId);
+      allow create: if signedIn() && inShop(request.resource.data.shopId);
+      allow update: if signedIn() && inShop(resource.data.shopId);
+      allow delete: if signedIn() && (isAdmin() || request.auth.uid == resource.data.shopId);
+    }
+
+    match /ledger/{id} {
+      allow read, delete: if signedIn() && (isAdmin() || request.auth.uid == resource.data.shopId);
+      allow create: if isRetailer() && request.resource.data.shopId == request.auth.uid;
+    }
+
+    match /attendance/{id} {
+      allow read: if signedIn() && (inShop(resource.data.shopId));
+      allow create: if signedIn() && me().role == 'operator'
+                    && request.resource.data.operatorId == request.auth.uid
+                    && request.resource.data.shopId == me().shopId;
+      allow update: if signedIn() && resource.data.operatorId == request.auth.uid;
+    }
+  }
+}
